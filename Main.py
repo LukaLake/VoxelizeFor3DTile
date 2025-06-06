@@ -118,9 +118,9 @@ for i in range(1, LOD_LEVELS):
 
 
 from py3dtiles.tileset.utils import TileContentReader
-from py3dtiles.tileset.tile_content import TileContent
-from py3dtiles.tileset.batch_table import BatchTable
-from py3dtiles.tileset.feature_table import FeatureTable
+from py3dtiles.tileset.content.tile_content import TileContent
+from py3dtiles.tileset.content.batch_table import BatchTable
+from py3dtiles.tileset.content.feature_table import FeatureTable
 from py3dtiles.tileset.tile import Tile
 from py3dtiles.tileset.tileset import Tileset
 import json
