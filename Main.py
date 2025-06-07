@@ -2,23 +2,63 @@ import trimesh
 import numpy as np
 
 # --- 输入参数 ---
-MODEL_FILE_PATH = "path/to/your/model.obj"  # 或 .stl, .ply, .glb 等trimesh支持的格式
+MODEL_FILE_PATH = r"D:\Datasets\PCLAsset\point_cloud.ply"  # 或 .stl, .ply, .glb 等trimesh支持的格式
 # 对于点云，可以使用 open3d 加载并转换为 trimesh.PointCloud 对象
 
 # --- 加载模型 ---
 try:
-    mesh = trimesh.load_mesh(MODEL_FILE_PATH)
-    print(f"模型 '{MODEL_FILE_PATH}' 加载成功.")
+    # 尝试使用 trimesh 直接加载
+    mesh_object = trimesh.load_mesh(MODEL_FILE_PATH)
+    print(f"模型 '{MODEL_FILE_PATH}' 使用 trimesh 加载成功.")
+    print(f"Trimesh 加载的对象类型: {type(mesh_object)}")
+
+    # 检查加载结果是否有点
+    if not hasattr(mesh_object, 'vertices') or len(mesh_object.vertices) == 0:
+        print("Trimesh 加载后顶点为空，尝试使用 Open3D...")
+        try:
+            import open3d as o3d
+            pcd = o3d.io.read_point_cloud(MODEL_FILE_PATH)
+            if not pcd.has_points():
+                raise ValueError("Open3D 加载点云失败或点云为空.")
+            mesh = trimesh.PointCloud(np.asarray(pcd.points))
+            # 如果原始点云有颜色，也可以尝试传递
+            # if pcd.has_colors():
+            #     mesh.colors = (np.asarray(pcd.colors) * 255).astype(np.uint8)
+            print(f"使用 Open3D 成功加载并转换为 trimesh.PointCloud，顶点数: {len(mesh.vertices)}")
+        except ImportError:
+            print("Open3D 未安装，无法作为备选方案加载。")
+            raise ValueError("Trimesh 加载顶点为空且 Open3D 不可用。")
+        except Exception as o3d_e:
+            print(f"使用 Open3D 加载失败: {o3d_e}")
+            raise
+    else:
+        mesh = mesh_object # Trimesh 直接加载成功且有点
+
 except Exception as e:
     print(f"加载模型失败: {e}")
     exit()
 
 # --- 预处理 (示例) ---
-# 1. 确保模型是水密的 (如果体素化算法需要)
-if hasattr(mesh, 'is_watertight') and not mesh.is_watertight:
-    print("警告: 模型非水密，尝试修复...")
-    mesh.fill_holes()
-    # mesh.fix_normals() # 可能也需要
+# 仅当加载的是 Trimesh 对象 (网格) 时，才进行水密性检查
+if isinstance(mesh, trimesh.Trimesh):
+    print("加载对象为 Trimesh，进行预处理。")
+    # 1. 确保模型是水密的 (如果体素化算法需要)
+    if not mesh.is_watertight: # Trimesh 对象总是有 is_watertight 属性
+        print("警告: 网格模型非水密，尝试修复...")
+        mesh.fill_holes()
+        # mesh.fix_normals() # 可能也需要
+        if not mesh.vertices.size or not mesh.faces.size:
+            print("警告: 修复后模型为空，请检查原始模型或修复步骤。")
+elif isinstance(mesh, trimesh.PointCloud):
+    print("加载对象为 PointCloud，跳过网格特定的水密性修复。")
+else:
+    print(f"加载的模型类型 ({type(mesh)}) 未知或不受支持，跳过预处理。")
+
+
+# 确保在继续之前 mesh 对象是有效的并且有顶点
+if not hasattr(mesh, 'vertices') or len(mesh.vertices) == 0:
+    print("错误：模型在预处理后没有顶点数据，无法进行体素化。")
+    exit()
 
 # 2. 坐标系对齐 (根据实际需求调整)
 # 例如，如果需要将Z轴朝上，而模型是Y轴朝上：
@@ -33,9 +73,12 @@ if hasattr(mesh, 'is_watertight') and not mesh.is_watertight:
 # target_scale_factor = ...
 # mesh.apply_scale(target_scale_factor)
 
+# ...existing code...
 print(f"模型包围盒 (预处理后): {mesh.bounds}")
-print(f"模型顶点数: {len(mesh.vertices)}, 面数: {len(mesh.faces)}")
-
+if isinstance(mesh, trimesh.Trimesh):
+    print(f"模型顶点数: {len(mesh.vertices)}, 面数: {len(mesh.faces)}")
+elif isinstance(mesh, trimesh.PointCloud):
+    print(f"模型顶点数: {len(mesh.vertices)}") # 点云没有传统意义上的“面”
 
 # --- 体素化参数 ---
 # PITCH 决定了最高LOD的体素大小 (立方体边长)
@@ -129,7 +172,7 @@ import shutil
 
 # --- 3D Tiles生成参数 ---
 OUTPUT_DIR = "output_3dtiles"
-TEMPLATE_CUBE_GLB = "path/to/your/cube_template.glb" # 1x1x1单位立方体
+TEMPLATE_CUBE_GLB = r"D:\Datasets\OBJAsset\gltf\1x1x1.glb" # 1x1x1单位立方体
 TILESET_NAME = "MyVoxelTileset"
 # GEOMETRIC_ERROR_BASE 和 FACTOR 用于计算每个LOD的 geometricError
 # geometricError 越大，瓦片在更远处被加载（更粗糙的LOD）
