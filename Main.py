@@ -21,7 +21,8 @@ import shutil
 import traceback
 from py3dtiles.tileset.tile import Tile
 from py3dtiles.tileset.tileset import TileSet
-from py3dtiles.tileset.content.b3dm import B3dm, B3dmHeader
+from py3dtiles.tileset.content.b3dm import B3dm # B3dmHeader is not typically used directly for content creation
+from py3dtiles.tileset.bounding_volume_box import BoundingVolumeBox # <--- 新增导入
 import pygltflib
 
 # --- 全局配置参数 ---
@@ -302,8 +303,11 @@ def main():
     
     # 4.1 初始化 Tileset 对象
     ts = TileSet()
-    ts.asset = {'version': '1.0', 'tilesetVersion': '1.0.0-my-voxel-b3dm'}
-    ts.geometric_error = float(GEOMETRIC_ERROR_BASE) # 使用 snake_case 并确保 float
+    # ts.asset = {'version': '1.0', 'tilesetVersion': '1.0.0-my-voxel-b3dm'} # <--- 移除或注释掉这行
+    # ts.asset 的 version 默认为 "1.0"，如果需要修改，可以像下面这样：
+    # ts.asset.version = "1.0" # (如果默认值不是您想要的)
+    ts.asset.tileset_version = '1.0.0-my-voxel-b3dm' # <--- 正确设置 tilesetVersion
+    ts.geometric_error = float(GEOMETRIC_ERROR_BASE)
 
     # 4.2 创建一个纯粹的、无内容的根瓦片作为容器
     root_tile = Tile()
@@ -313,21 +317,27 @@ def main():
     lod0_pitch = all_lods_data[0]['pitch']
     if len(lod0_centers) == 0:
         print("错误：LOD0 没有体素中心，无法计算根包围盒。将使用默认包围盒。")
-        root_tile.bounding_volume = {'box': [0.0,0.0,0.0, 1.0,0.0,0.0, 0.0,1.0,0.0, 0.0,0.0,1.0]}
+        bounding_box_data = {'box': [0.0,0.0,0.0, 1.0,0.0,0.0, 0.0,1.0,0.0, 0.0,0.0,1.0]}
+        root_tile.bounding_volume = BoundingVolumeBox.from_dict(bounding_box_data)
+        assert root_tile.bounding_volume is not None, "根瓦片的 bounding_volume 在赋值后为 None!"
+        print(f"  根瓦片 bounding_volume 类型: {type(root_tile.bounding_volume)}")
     else:
         min_bound = np.min(lod0_centers - lod0_pitch / 2, axis=0)
         max_bound = np.max(lod0_centers + lod0_pitch / 2, axis=0)
         center = (min_bound + max_bound) / 2
         half_size = (max_bound - min_bound) / 2
-        root_tile.bounding_volume = {'box': [ # 使用 snake_case 并确保 float
+        bounding_box_data = {'box': [
             float(center[0]), float(center[1]), float(center[2]),
-            float(half_size[0]), 0.0, 0.0, 
-            0.0, float(half_size[1]), 0.0, 
+            float(half_size[0]), 0.0, 0.0,
+            0.0, float(half_size[1]), 0.0,
             0.0, 0.0, float(half_size[2])
         ]}
-    
-    root_tile.refine = 'REPLACE' # 使用 snake_case
-    ts.root = root_tile
+        root_tile.bounding_volume = BoundingVolumeBox.from_dict(bounding_box_data)
+        assert root_tile.bounding_volume is not None, "根瓦片的 bounding_volume 在赋值后为 None!"
+        print(f"  根瓦片 bounding_volume 类型: {type(root_tile.bounding_volume)}")
+
+    root_tile.refine = 'REPLACE'
+    ts.root_tile = root_tile
 
     # 4.3 为瓦片集设置地理定位
     if GEOLOCATION_ENABLED:
@@ -337,12 +347,12 @@ def main():
                 longitude=TARGET_LONGITUDE, latitude=TARGET_LATITUDE, height=TARGET_HEIGHT
             )
             # ts.root.transform is already snake_case and expects a list of floats
-            ts.root.transform = [float(x) for x in transform_matrix.flatten('F').tolist()]
+            ts.root_tile.transform = [float(x) for x in transform_matrix.flatten('F').tolist()]
         except Exception as e:
             print(f"错误: 计算地理变换矩阵时失败: {e}")
 
     # 4.4 循环为每个LOD创建带内容的瓦片，并建立父子链接
-    parent_tile = ts.root  # 从根瓦片开始，作为第一个父节点
+    parent_tile = ts.root_tile  # 从根瓦片开始，作为第一个父节点
     tile_counter = 0
 
     for lod_level in range(LOD_LEVELS):
@@ -379,13 +389,15 @@ def main():
         min_b, max_b = merged_mesh.bounds
         c = (min_b + max_b) / 2
         hs = (max_b - min_b) / 2
-        lod_tile.bounding_volume = {'box': [ # 使用 snake_case 并确保 float
-            float(c[0]), float(c[1]), float(c[2]), 
-            float(hs[0]), 0.0, 0.0, 
-            0.0, float(hs[1]), 0.0, 
+        bounding_box_data_lod = {'box': [
+            float(c[0]), float(c[1]), float(c[2]),
+            float(hs[0]), 0.0, 0.0,
+            0.0, float(hs[1]), 0.0,
             0.0, 0.0, float(hs[2])
         ]}
-        print(f"  已设置包围盒和几何误差。")
+        lod_tile.bounding_volume = BoundingVolumeBox.from_dict(bounding_box_data_lod)
+        assert lod_tile.bounding_volume is not None, f"LOD {lod_level} 瓦片的 bounding_volume 在赋值后为 None!"
+        print(f"  LOD {lod_level} 已设置包围盒和几何误差。bounding_volume 类型: {type(lod_tile.bounding_volume)}")
 
         # D. 将这个属性完备的瓦片链接到其父瓦片
         if parent_tile.children is None:
@@ -401,6 +413,32 @@ def main():
             
     # --- 重构结束 ---
 
+    # --- 在调用 to_dict() 之前手动检查瓦片层级 ---
+    print("\n--- 手动验证瓦片层级中的 bounding_volume ---")
+    def validate_tile_bounding_volumes(tile_obj, path="root"):
+        if tile_obj.bounding_volume is None:
+            print(f"错误: 位于路径 '{path}' 的瓦片 bounding_volume 为 None。")
+            return False
+        else:
+            print(f"路径 '{path}' 的瓦片 bounding_volume 类型: {type(tile_obj.bounding_volume)}")
+        
+        if tile_obj.children:
+            for i, child in enumerate(tile_obj.children):
+                if not validate_tile_bounding_volumes(child, f"{path}/children[{i}]"):
+                    return False
+        return True
+
+    if ts.root_tile is not None:
+        if not validate_tile_bounding_volumes(ts.root_tile):
+            print("手动验证失败，存在 bounding_volume 为 None 的瓦片。")
+            # 在这里可以选择直接返回或退出，避免调用 to_dict() 进一步报错
+            return 
+        else:
+            print("手动验证通过，所有瓦片均有 bounding_volume。")
+    else:
+        print("错误: ts.root 为 None，无法进行验证。")
+        return
+    
     print("\n--- 5. 保存 tileset.json ---")
     try:
         # 现在调用 to_dict() 应该是安全的
