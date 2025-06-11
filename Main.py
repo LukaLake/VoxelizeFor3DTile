@@ -1,322 +1,427 @@
+# -----------------------------------------------------------------------------
+# Main.py - 实景三维模型体素化及3D Tiles (B3DM) 生成脚本
+#
+# 功能:
+# 1. 加载三维模型文件 (支持网格和点云 .ply)。
+# 2. 对模型进行体素化处理。
+# 3. 生成多个层次细节 (LOD)。
+# 4. 将每个LOD的体素打包成 B3DM 格式的瓦片。
+# 5. 生成一个包含地理位置信息的 tileset.json 文件。
+#
+# 依赖:
+# pip install trimesh numpy open3d py3dtiles pygltflib scipy
+# -----------------------------------------------------------------------------
+
 import trimesh
 import numpy as np
-
-# --- 输入参数 ---
-MODEL_FILE_PATH = r"D:\Datasets\PCLAsset\point_cloud.ply"  # 或 .stl, .ply, .glb 等trimesh支持的格式
-# 对于点云，可以使用 open3d 加载并转换为 trimesh.PointCloud 对象
-
-# --- 加载模型 ---
-try:
-    # 尝试使用 trimesh 直接加载
-    mesh_object = trimesh.load_mesh(MODEL_FILE_PATH)
-    print(f"模型 '{MODEL_FILE_PATH}' 使用 trimesh 加载成功.")
-    print(f"Trimesh 加载的对象类型: {type(mesh_object)}")
-
-    # 检查加载结果是否有点
-    if not hasattr(mesh_object, 'vertices') or len(mesh_object.vertices) == 0:
-        print("Trimesh 加载后顶点为空，尝试使用 Open3D...")
-        try:
-            import open3d as o3d
-            pcd = o3d.io.read_point_cloud(MODEL_FILE_PATH)
-            if not pcd.has_points():
-                raise ValueError("Open3D 加载点云失败或点云为空.")
-            mesh = trimesh.PointCloud(np.asarray(pcd.points))
-            # 如果原始点云有颜色，也可以尝试传递
-            # if pcd.has_colors():
-            #     mesh.colors = (np.asarray(pcd.colors) * 255).astype(np.uint8)
-            print(f"使用 Open3D 成功加载并转换为 trimesh.PointCloud，顶点数: {len(mesh.vertices)}")
-        except ImportError:
-            print("Open3D 未安装，无法作为备选方案加载。")
-            raise ValueError("Trimesh 加载顶点为空且 Open3D 不可用。")
-        except Exception as o3d_e:
-            print(f"使用 Open3D 加载失败: {o3d_e}")
-            raise
-    else:
-        mesh = mesh_object # Trimesh 直接加载成功且有点
-
-except Exception as e:
-    print(f"加载模型失败: {e}")
-    exit()
-
-# --- 预处理 (示例) ---
-# 仅当加载的是 Trimesh 对象 (网格) 时，才进行水密性检查
-if isinstance(mesh, trimesh.Trimesh):
-    print("加载对象为 Trimesh，进行预处理。")
-    # 1. 确保模型是水密的 (如果体素化算法需要)
-    if not mesh.is_watertight: # Trimesh 对象总是有 is_watertight 属性
-        print("警告: 网格模型非水密，尝试修复...")
-        mesh.fill_holes()
-        # mesh.fix_normals() # 可能也需要
-        if not mesh.vertices.size or not mesh.faces.size:
-            print("警告: 修复后模型为空，请检查原始模型或修复步骤。")
-elif isinstance(mesh, trimesh.PointCloud):
-    print("加载对象为 PointCloud，跳过网格特定的水密性修复。")
-else:
-    print(f"加载的模型类型 ({type(mesh)}) 未知或不受支持，跳过预处理。")
-
-
-# 确保在继续之前 mesh 对象是有效的并且有顶点
-if not hasattr(mesh, 'vertices') or len(mesh.vertices) == 0:
-    print("错误：模型在预处理后没有顶点数据，无法进行体素化。")
-    exit()
-
-# 2. 坐标系对齐 (根据实际需求调整)
-# 例如，如果需要将Z轴朝上，而模型是Y轴朝上：
-# rotation_matrix = trimesh.transformations.rotation_matrix(-np.pi/2, [1, 0, 0])
-# mesh.apply_transform(rotation_matrix)
-
-# 3. 将模型移动到原点附近 (可选，方便后续处理)
-# mesh.apply_translation(-mesh.bounds[0]) # 将最小边界点移到原点
-# mesh.apply_translation(-mesh.centroid) # 将质心移到原点
-
-# 4. 统一单位 (如果需要)
-# target_scale_factor = ...
-# mesh.apply_scale(target_scale_factor)
-
-# ...existing code...
-print(f"模型包围盒 (预处理后): {mesh.bounds}")
-if isinstance(mesh, trimesh.Trimesh):
-    print(f"模型顶点数: {len(mesh.vertices)}, 面数: {len(mesh.faces)}")
-elif isinstance(mesh, trimesh.PointCloud):
-    print(f"模型顶点数: {len(mesh.vertices)}") # 点云没有传统意义上的“面”
-
-# --- 体素化参数 ---
-# PITCH 决定了最高LOD的体素大小 (立方体边长)
-# 例如，如果模型单位是米，PITCH = 1.0 表示1立方米的体素
-HIGHEST_LOD_PITCH = 1.0  # 体素边长，也是最高LOD的分辨率
-
-# --- 执行体素化 ---
-# `voxelized` 方法返回一个 VoxelGrid 对象
-# `pitch` 参数是体素的边长
-voxel_grid = mesh.voxelized(pitch=HIGHEST_LOD_PITCH)
-print(f"体素化完成. 体素网格形状: {voxel_grid.shape}")
-
-# VoxelGrid.encoding.dense_indices 包含了所有被占据体素的整数索引 (i, j, k)
-# VoxelGrid.transform 是从体素索引到世界坐标的变换矩阵
-occupied_voxel_indices = voxel_grid.encoding.dense_indices # (N, 3) array of int indices
-num_voxels_lod0 = len(occupied_voxel_indices)
-print(f"LOD 0 (最高细节) 占据的体素数量: {num_voxels_lod0}")
-
-if num_voxels_lod0 == 0:
-    print("没有生成任何体素，请检查模型或PITCH参数。")
-    exit()
-
-# --- 将体素索引转换为世界坐标中心点 ---
-# 体素的中心点 = transform @ (indices + 0.5).T
-# voxel_grid.points 已经为我们计算好了这些中心点
-voxel_centers_lod0_world = voxel_grid.points # (N, 3) array of world coordinates
-print(f"LOD 0 体素中心点 (世界坐标) 示例 (前5个): \n{voxel_centers_lod0_world[:5]}")
-
-# (可选) 提取体素颜色
-# 如果需要，可以从原始网格的最近表面点采样颜色
-# 这部分相对复杂，trimesh 本身不直接提供 voxel-to-color 的简单映射
-# 可能需要结合 trimesh.proximity.ProximityQuery
-# voxel_colors_lod0 = [] # 存储颜色信息
-
-# --- LOD组织参数 ---
-LOD_LEVELS = 3  # 例如，LOD 0, LOD 1, LOD 2
-LOD_DOWNSAMPLE_FACTORS = [1, 2, 4] # LOD 0是原始，LOD 1每2x2x2个体素合并，LOD 2每4x4x4个体素合并
-                                 # 确保因子是2的幂次方，便于八叉树逻辑
-
-all_lods_voxel_centers = {} # 字典，键是LOD级别，值是该LOD的体素中心点列表
-
-# --- LOD 0 ---
-all_lods_voxel_centers[0] = voxel_centers_lod0_world
-print(f"LOD 0 中心点数量: {len(all_lods_voxel_centers[0])}")
-
-# --- 生成更低细节的LOD (通过降采样体素中心点) ---
-# 这是一个简化的降采样示例，实际应用中可能需要更精细的八叉树聚合
-# VoxelGrid 的 transform 和 pitch 对于理解坐标很重要
-origin = voxel_grid.transform[:3, 3] # 体素网格的原点
-current_pitch = voxel_grid.pitch       # 当前LOD的体素大小
-
-for i in range(1, LOD_LEVELS):
-    factor = LOD_DOWNSAMPLE_FACTORS[i]
-    prev_lod_centers = all_lods_voxel_centers[i-1]
-
-    if not len(prev_lod_centers):
-        all_lods_voxel_centers[i] = np.array([])
-        print(f"LOD {i} 中心点数量: 0 (上一级LOD为空)")
-        continue
-
-    # 将世界坐标转换回相对于该LOD原点的索引 (粗略)
-    # 注意：这种降采样方法比较粗糙，直接在世界坐标上操作可能更好
-    # 或者，如果使用八叉树体素化，可以直接从八叉树的不同层级提取
-    scaled_indices = np.floor((prev_lod_centers - origin) / (current_pitch * factor)).astype(int)
-    unique_scaled_indices, inv_indices = np.unique(scaled_indices, axis=0, return_inverse=True)
-
-    # 为每个新的粗糙体素选择一个代表点（例如，原始点中的第一个，或计算平均值）
-    # 这里我们简单地取每个独特粗糙索引对应的第一个原始中心点作为近似
-    # 更准确的方法是计算这些原始中心点的平均值作为新LOD的中心
-    new_lod_centers = []
-    for j in range(len(unique_scaled_indices)):
-        # 找到属于这个粗糙体素的所有原始LOD中心点
-        original_points_in_coarse_voxel = prev_lod_centers[inv_indices == j]
-        # 计算这些点的平均值作为新LOD体素的中心
-        new_lod_centers.append(np.mean(original_points_in_coarse_voxel, axis=0))
-
-    all_lods_voxel_centers[i] = np.array(new_lod_centers) if new_lod_centers else np.array([])
-    print(f"LOD {i} 中心点数量: {len(all_lods_voxel_centers[i])}")
-    # current_pitch *= factor # 如果下一级LOD的pitch是上一级的倍数
-
-
-from py3dtiles.tileset.utils import TileContentReader
-from py3dtiles.tileset.content.tile_content import TileContent
-from py3dtiles.tileset.content.batch_table import BatchTable
-from py3dtiles.tileset.content.feature_table import FeatureTable
-from py3dtiles.tileset.tile import Tile
-from py3dtiles.tileset.tileset import Tileset
+import open3d as o3d
 import json
 import os
 import shutil
+import traceback
+from py3dtiles.tileset.tile import Tile
+from py3dtiles.tileset.tileset import TileSet
+from py3dtiles.tileset.content.b3dm import B3dm, B3dmHeader
+import pygltflib
 
-# --- 3D Tiles生成参数 ---
-OUTPUT_DIR = "output_3dtiles"
-TEMPLATE_CUBE_GLB = r"D:\Datasets\OBJAsset\gltf\1x1x1.glb" # 1x1x1单位立方体
-TILESET_NAME = "MyVoxelTileset"
-# GEOMETRIC_ERROR_BASE 和 FACTOR 用于计算每个LOD的 geometricError
+# --- 全局配置参数 ---
+DEBUG = True  # 设置为 True 以启用详细的调试输出
+
+# --- 输入与输出配置 ---
+MODEL_FILE_PATH = r"D:\Datasets\PCLAsset\point_cloud.ply"  # 输入模型文件路径 (.ply, .obj, .stl等)
+OUTPUT_DIR = "output_3dtiles_b3dm"  # 输出3D Tiles数据集的目录
+
+# --- 地理定位配置 ---
+# !!! 重要: 请将以下经纬高替换为您模型的实际地理锚点 !!!
+# 这是将您的本地模型放置到地球正确位置的关键
+GEOLOCATION_ENABLED = False  # 是否启用地理定位
+# 示例: 武汉大学附近某点
+TARGET_LONGITUDE = 114.36
+TARGET_LATITUDE = 30.54
+TARGET_HEIGHT = 50.0  # 相对于WGS84椭球的高度(米)
+
+# --- 体素化与LOD配置 ---
+HIGHEST_LOD_PITCH = 1.0  # 最高细节LOD的体素边长(米)
+LOD_LEVELS = 3  # 要生成的LOD层级总数
+# 每个LOD相对于最高LOD的降采样聚合因子 (例如, 2表示2x2x2个体素合并)
+LOD_DOWNSAMPLE_FACTORS = [1, 2, 4]
+
+# --- 3D Tiles 配置 ---
+# 根瓦片的几何误差，通常是场景尺寸的一个比例
 # geometricError 越大，瓦片在更远处被加载（更粗糙的LOD）
-# 通常，根瓦片的 geometricError 较大，叶子瓦片的 geometricError 较小
-# 这里的设置需要根据场景大小和LOD层级仔细调整
-GEOMETRIC_ERROR_BASE = 200 # 根瓦片的 geometricError
-GEOMETRIC_ERROR_LOD_FACTOR = 0.5 # 每深入一层LOD，geometricError 乘以这个因子
+GEOMETRIC_ERROR_BASE = 500
+# 每深入一层LOD，geometricError 的衰减因子
+GEOMETRIC_ERROR_LOD_FACTOR = 0.5
 
-# --- 清理并创建输出目录 ---
-if os.path.exists(OUTPUT_DIR):
-    shutil.rmtree(OUTPUT_DIR)
-os.makedirs(OUTPUT_DIR)
 
-# --- 读取模板立方体GLB内容 ---
-try:
-    with open(TEMPLATE_CUBE_GLB, 'rb') as f:
-        glb_template_content = f.read()
-except FileNotFoundError:
-    print(f"错误: 模板立方体 GLB 文件 '{TEMPLATE_CUBE_GLB}' 未找到.")
-    exit()
+def load_and_preprocess_model(file_path):
+    """
+    加载并预处理三维模型。
+    支持直接加载网格，或将点云转换为 trimesh.PointCloud 对象。
+    """
+    print("--- 1. 加载与预处理模型 ---")
+    try:
+        # 尝试使用 trimesh 直接加载
+        mesh_object = trimesh.load(file_path)
+        if isinstance(mesh_object, trimesh.Trimesh) and mesh_object.vertices.size > 0:
+            print(f"成功加载为网格模型 (Trimesh)，顶点数: {len(mesh_object.vertices)}")
+            # 对网格模型进行预处理
+            if not mesh_object.is_watertight:
+                print("警告: 网格模型非水密，尝试修复...")
+                mesh_object.fill_holes()
+            return mesh_object
+        elif isinstance(mesh_object, trimesh.PointCloud) and mesh_object.vertices.size > 0:
+            print(f"成功加载为点云模型 (trimesh.PointCloud)，顶点数: {len(mesh_object.vertices)}")
+            return mesh_object
+        else:
+            # 如果 trimesh 加载失败或为空，尝试使用 Open3D 作为备选方案加载点云
+            print("Trimesh 加载结果为空或非支持类型，尝试使用 Open3D...")
+            pcd = o3d.io.read_point_cloud(file_path)
+            if not pcd.has_points():
+                raise ValueError("Open3D 加载点云失败或点云为空。")
+            points = np.asarray(pcd.points)
+            point_cloud = trimesh.PointCloud(points)
+            print(f"使用 Open3D 成功加载点云，顶点数: {len(point_cloud.vertices)}")
+            return point_cloud
+    except Exception as e:
+        print(f"加载模型失败: {e}")
+        traceback.print_exc()
+        return None
 
-# --- 创建 Tileset 对象 ---
-ts = Tileset()
-ts.asset = {'version': '1.0', 'tilesetVersion': '1.0.0-myvoxel'}
-ts.geometricError = GEOMETRIC_ERROR_BASE # 根瓦片的 geometricError
 
-# --- 创建根瓦片 ---
-# 根瓦片通常不直接包含内容，而是指向子瓦片（LOD 0的瓦片）
-# 或者，根瓦片可以包含最低LOD的内容
-root_tile = Tile()
-root_tile.geometricError = GEOMETRIC_ERROR_BASE
-# 计算整个数据集的包围盒 (所有LOD 0体素的包围盒)
-if len(all_lods_voxel_centers[0]) > 0:
-    min_bound = np.min(all_lods_voxel_centers[0] - HIGHEST_LOD_PITCH / 2, axis=0)
-    max_bound = np.max(all_lods_voxel_centers[0] + HIGHEST_LOD_PITCH / 2, axis=0)
-    center = (min_bound + max_bound) / 2
-    half_size = (max_bound - min_bound) / 2
-    # py3dtiles 使用的包围盒格式: [centerX, centerY, centerZ, halfX, 0, 0, 0, halfY, 0, 0, 0, halfZ]
-    root_tile.boundingVolume = {'box': [
-        center[0], center[1], center[2],
-        half_size[0], 0, 0,
-        0, half_size[1], 0,
-        0, 0, half_size[2]
-    ]}
-else: # 如果没有体素，创建一个默认的小包围盒
-    root_tile.boundingVolume = {'box': [0,0,0, 1,0,0, 0,1,0, 0,0,1]}
+def voxelize_model(model, pitch):
+    """
+    将输入的 trimesh 对象 (网格或点云) 进行体素化。
+    返回一个 trimesh.voxel.VoxelGrid 对象。
+    """
+    print(f"\n--- 2. 执行体素化 (Pitch: {pitch}) ---")
+    if isinstance(model, trimesh.Trimesh):
+        # 对于网格模型，可以直接调用 .voxelized 方法
+        print("对网格模型进行体素化...")
+        return model.voxelized(pitch=pitch)
+        
+    elif isinstance(model, trimesh.PointCloud):
+        # 对于点云模型，需要手动创建 VoxelGrid (恢复您原来的正确方法)
+        print("对点云模型进行体素化...")
+        if len(model.vertices) == 0:
+            print("错误：点云对象不包含顶点。")
+            return None
 
-ts.root = root_tile
-current_parent_tile = root_tile
-tile_counter = 0
+        points = model.vertices
+        
+        # 1. 将点坐标转换为离散的体素索引
+        # 使用 np.floor 比 np.round 更能保证体素对齐的稳定性
+        discrete_indices = np.floor(points / pitch).astype(int)
+        
+        # 2. 找到所有被占据的体素的唯一索引
+        unique_indices = np.unique(discrete_indices, axis=0)
+        
+        if unique_indices.shape[0] == 0:
+            print("警告：根据PITCH参数，点云未占据任何体素单元。")
+            # 返回一个空的 VoxelGrid
+            return trimesh.voxel.VoxelGrid(
+                trimesh.voxel.encoding.SparseBinaryEncoding(np.empty((0, 3), dtype=int)),
+                trimesh.transformations.scale_and_translate(scale=pitch)
+            )
 
-# --- 为每个LOD层级创建瓦片 ---
-# 简化：这里我们为每个LOD创建一个单独的瓦片。
-# 实际应用中，如果一个LOD的体素数量过多，需要进一步空间划分为多个瓦片（例如使用八叉树）。
-for lod_level in range(LOD_LEVELS):
-    voxel_centers_current_lod = all_lods_voxel_centers[lod_level]
-    num_voxels_current_lod = len(voxel_centers_current_lod)
+        # 3. 计算编码的原点和相对索引
+        origin_index = unique_indices.min(axis=0)
+        sparse_relative_indices = unique_indices - origin_index
+        encoding_shape = sparse_relative_indices.max(axis=0) + 1
 
-    if num_voxels_current_lod == 0:
-        print(f"LOD {lod_level} 没有体素，跳过生成瓦片.")
-        continue
+        # 4. 创建稀疏二进制编码对象
+        voxel_encoding = trimesh.voxel.encoding.SparseBinaryEncoding(
+            sparse_relative_indices,
+            shape=encoding_shape
+        )
 
-    lod_pitch = HIGHEST_LOD_PITCH * LOD_DOWNSAMPLE_FACTORS[lod_level]
+        # 5. 计算从0基体素索引到世界坐标的变换矩阵
+        transform_translation = origin_index * pitch
+        voxel_transform = trimesh.transformations.scale_and_translate(
+            scale=pitch,
+            translate=transform_translation
+        )
 
-    # --- 创建i3dm内容 ---
-    # 1. 特征表 (FeatureTable) - 定义实例的位置、缩放等
-    # 位置 (POSITION) 是必须的
-    positions = voxel_centers_current_lod.astype(np.float32) # (N, 3)
+        # 6. 创建并返回 VoxelGrid 对象
+        return trimesh.voxel.VoxelGrid(voxel_encoding, voxel_transform)
+        
+    else:
+        print(f"错误：未知的模型类型 {type(model)}。")
+        return None
 
-    # 缩放 (RTC_CENTER 和 SCALE_NON_UNIFORM)
-    # 如果模板是1x1x1，我们需要根据lod_pitch进行缩放
-    # py3dtiles i3dm 通常将实例的变换原点设置为RTC_CENTER，然后应用相对变换
-    # 这里简化，我们直接在世界坐标中放置，所以RTC_CENTER可以为(0,0,0)
-    # 或者，更常见的是将RTC_CENTER设置为瓦片的中心，positions是相对于RTC_CENTER的
-    # 我们这里假设positions已经是世界坐标
-    scales = np.full((num_voxels_current_lod, 3), lod_pitch, dtype=np.float32)
 
-    # (可选) 法线/旋转 (NORMAL_UP, NORMAL_RIGHT 或四元数) - 对于轴对齐立方体，可以省略或使用默认值
-    # (可选) 批次ID (BATCH_ID) - 如果需要每个实例有不同的属性（通过批处理表）
+def generate_lods(voxel_grid, num_levels, downsample_factors, base_pitch):
+    """
+    从最高细节的体素网格生成多个LOD层级的体素中心点。
+    采用可靠的数学方法对点云中心进行降采样，不再使用 .voxelized()。
+    """
+    print("\n--- 3. 生成多层次细节 (LOD) ---")
+    if not voxel_grid or voxel_grid.is_empty:
+        print("输入的体素网格为空，无法生成LOD。")
+        return None
 
-    feature_table_dict = {'POSITION': positions}
-    if lod_pitch != 1.0: # 如果我们的模板不是预期的lod_pitch大小
-         feature_table_dict['SCALE_NON_UNIFORM'] = scales
-    # 如果需要RTC_CENTER
-    # rtc_center = np.mean(positions, axis=0) # 例如瓦片的中心
-    # feature_table_dict['RTC_CENTER'] = rtc_center
-    # feature_table_dict['POSITION'] = positions - rtc_center # 相对位置
+    all_lods_data = {}
+    lod0_centers = voxel_grid.points
+    
+    if lod0_centers.shape[0] == 0:
+        print("LOD 0 没有体素，无法生成后续LOD。")
+        return None
 
-    ft = FeatureTable.from_dict(feature_table_dict)
+    # LOD 0 直接使用体素化的结果
+    all_lods_data[0] = {
+        'centers': lod0_centers,
+        'pitch': base_pitch 
+    }
+    print(f"LOD 0: {len(lod0_centers)} 个体素, Pitch: {base_pitch:.2f}")
 
-    # 2. 批处理表 (BatchTable) - (可选) 定义每个实例的附加属性，如颜色、ID
-    # bt = BatchTable.from_dict({'instance_id': np.arange(num_voxels_current_lod)})
+    # 通过降采样生成更低细节的LOD
+    for i in range(1, num_levels):
+        factor = downsample_factors[i]
+        prev_lod_centers = all_lods_data[i-1]['centers']
+        new_pitch = base_pitch * factor
 
-    # 3. 创建 TileContent (i3dm)
-    i3dm_content = TileContent()
-    i3dm_content.feature_table = ft
-    # i3dm_content.batch_table = bt # 如果有批处理表
-    i3dm_content.body = glb_template_content # GLB内容
-    i3dm_content.header = TileContentReader.read_binary_tile_content_header(i3dm_content.to_array()) # 自动生成头部
+        if len(prev_lod_centers) == 0:
+            print(f"LOD {i}: 上一级LOD为空，跳过。")
+            all_lods_data[i] = {'centers': np.array([]), 'pitch': new_pitch}
+            continue
 
-    # --- 保存 i3dm 文件 ---
-    i3dm_filename = f"tile_lod{lod_level}_{tile_counter}.i3dm"
-    i3dm_filepath = os.path.join(OUTPUT_DIR, i3dm_filename)
-    with open(i3dm_filepath, 'wb') as f:
-        f.write(i3dm_content.to_array())
-    print(f"已生成: {i3dm_filepath}")
-    tile_counter += 1
+        # --- 开始决定性的修正：手动降采样点云 ---
+        # 1. 计算每个点所属的更大、更粗糙的体素的索引
+        coarse_voxel_indices = np.floor(prev_lod_centers / new_pitch).astype(int)
 
-    # --- 创建或更新 Tile 对象 ---
-    if lod_level == 0: # 最高LOD作为根瓦片的内容或根瓦片的直接子瓦片
-        tile_for_lod = current_parent_tile # 如果根瓦片直接承载LOD0
-        # 如果根瓦片不承载内容，而是作为容器：
-        # tile_for_lod = Tile()
-        # current_parent_tile.children.append(tile_for_lod)
-    else: # 更低LOD作为上一级LOD瓦片的子瓦片 (实现LOD切换)
-        new_tile = Tile()
-        current_parent_tile.children.append(new_tile)
-        tile_for_lod = new_tile
-        current_parent_tile = new_tile # 下一个LOD的父级是当前创建的这个
+        # 2. 找到唯一的粗糙体素索引，并获取每个原始点对应的组ID
+        unique_coarse_indices, inverse_indices = np.unique(
+            coarse_voxel_indices, axis=0, return_inverse=True
+        )
 
-    tile_for_lod.content_uri = i3dm_filename
-    tile_for_lod.geometricError = GEOMETRIC_ERROR_BASE * (GEOMETRIC_ERROR_LOD_FACTOR ** lod_level)
+        # 3. 为每个唯一的粗糙体素组计算一个新的中心点（通过平均值）
+        new_lod_centers = []
+        # 遍历每一个唯一的组 (j 是从 0 到 组数-1 的索引)
+        for j in range(len(unique_coarse_indices)):
+            # 找到所有属于当前组 j 的原始中心点
+            points_in_group = prev_lod_centers[inverse_indices == j]
+            # 计算这些点的平均值，作为新LOD的体素中心
+            new_center = np.mean(points_in_group, axis=0)
+            new_lod_centers.append(new_center)
+        
+        # 将结果存入字典
+        all_lods_data[i] = {
+            'centers': np.array(new_lod_centers) if new_lod_centers else np.array([]),
+            'pitch': new_pitch
+        }
+        # --- 修正结束 ---
 
-    # 计算当前LOD瓦片的包围盒
-    if num_voxels_current_lod > 0:
-        min_b = np.min(voxel_centers_current_lod - lod_pitch / 2, axis=0)
-        max_b = np.max(voxel_centers_current_lod + lod_pitch / 2, axis=0)
+        print(f"LOD {i}: {len(all_lods_data[i]['centers'])} 个体素, Pitch: {new_pitch:.2f}")
+
+    return all_lods_data
+
+
+def create_b3dm_content(voxel_centers, pitch):
+    """
+    为给定的体素中心点和大小创建一个 B3DM 瓦片内容。
+    将所有体素（立方体）合并成一个大的网格，并导出为 GLB。
+    返回一个 py3dtiles 的 B3dm 对象。
+    """
+    if len(voxel_centers) == 0:
+        return None
+
+    # 为每个体素中心点创建一个立方体网格
+    list_of_cube_meshes = []
+    for center_point in voxel_centers:
+        # trimesh.creation.box 默认中心在原点，我们需要移动它
+        cube_mesh = trimesh.creation.box(extents=[pitch, pitch, pitch])
+        cube_mesh.apply_translation(center_point)
+        list_of_cube_meshes.append(cube_mesh)
+
+    # 合并所有小立方体为一个大网格
+    if not list_of_cube_meshes:
+        return None
+    merged_mesh = trimesh.util.concatenate(list_of_cube_meshes)
+
+    # 导出合并后的网格为 GLB 字节流
+    glb_body_bytes = merged_mesh.export(file_type='glb')
+    if not glb_body_bytes:
+        print("错误: 导出的 GLB 内容为空。")
+        return None
+
+    # 使用 pygltflib 加载 GLB 字节，以便 py3dtiles 处理
+    gltf_asset = pygltflib.GLTF2.load_from_bytes(glb_body_bytes)
+
+    # 创建 B3DM 内容对象
+    # 对于简单的 B3DM，我们不需要复杂的批处理表
+    b3dm_content = B3dm.from_gltf(gltf=gltf_asset)
+    
+    return b3dm_content, merged_mesh
+
+
+def fix_numpy_types_in_dict(d):
+    """
+    递归地将字典中所有Numpy数值类型转换为标准的Python类型，以便JSON序列化。
+    """
+    if isinstance(d, dict):
+        return {k: fix_numpy_types_in_dict(v) for k, v in d.items()}
+    elif isinstance(d, list):
+        return [fix_numpy_types_in_dict(i) for i in d]
+    elif isinstance(d, np.integer):
+        return int(d)
+    elif isinstance(d, np.floating):
+        return float(d)
+    return d
+
+
+def main():
+    """
+    主执行函数 (已重构瓦片创建逻辑以确保健壮性)
+    """
+    # 0. 准备工作
+    if os.path.exists(OUTPUT_DIR):
+        print(f"输出目录 '{OUTPUT_DIR}' 已存在，正在清理...")
+        shutil.rmtree(OUTPUT_DIR)
+    os.makedirs(OUTPUT_DIR)
+    print(f"已创建输出目录: '{OUTPUT_DIR}'")
+
+    # 1. 加载与预处理
+    model = load_and_preprocess_model(MODEL_FILE_PATH)
+    if model is None:
+        return
+
+    # 2. 体素化
+    voxel_grid = voxelize_model(model, HIGHEST_LOD_PITCH)
+    if voxel_grid is None or voxel_grid.is_empty:
+        print("体素化失败或结果为空，程序终止。")
+        return
+
+    # 3. 生成LODs
+    all_lods_data = generate_lods(voxel_grid, LOD_LEVELS, LOD_DOWNSAMPLE_FACTORS, HIGHEST_LOD_PITCH)
+    if all_lods_data is None:
+        print("LOD 生成失败，程序终止。")
+        return
+
+    # -------------------------------------------------------------------------
+    # --- 关键修正: 重构 3D Tiles 数据集创建逻辑 ---
+    # -------------------------------------------------------------------------
+    print("\n--- 4. 创建 3D Tiles 数据集 (重构后逻辑) ---")
+    
+    # 4.1 初始化 Tileset 对象
+    ts = TileSet()
+    ts.asset = {'version': '1.0', 'tilesetVersion': '1.0.0-my-voxel-b3dm'}
+    ts.geometric_error = float(GEOMETRIC_ERROR_BASE) # 使用 snake_case 并确保 float
+
+    # 4.2 创建一个纯粹的、无内容的根瓦片作为容器
+    root_tile = Tile()
+    
+    # 计算并设置根瓦片的包围盒
+    lod0_centers = all_lods_data[0]['centers']
+    lod0_pitch = all_lods_data[0]['pitch']
+    if len(lod0_centers) == 0:
+        print("错误：LOD0 没有体素中心，无法计算根包围盒。将使用默认包围盒。")
+        root_tile.bounding_volume = {'box': [0.0,0.0,0.0, 1.0,0.0,0.0, 0.0,1.0,0.0, 0.0,0.0,1.0]}
+    else:
+        min_bound = np.min(lod0_centers - lod0_pitch / 2, axis=0)
+        max_bound = np.max(lod0_centers + lod0_pitch / 2, axis=0)
+        center = (min_bound + max_bound) / 2
+        half_size = (max_bound - min_bound) / 2
+        root_tile.bounding_volume = {'box': [ # 使用 snake_case 并确保 float
+            float(center[0]), float(center[1]), float(center[2]),
+            float(half_size[0]), 0.0, 0.0, 
+            0.0, float(half_size[1]), 0.0, 
+            0.0, 0.0, float(half_size[2])
+        ]}
+    
+    root_tile.refine = 'REPLACE' # 使用 snake_case
+    ts.root = root_tile
+
+    # 4.3 为瓦片集设置地理定位
+    if GEOLOCATION_ENABLED:
+        print(f"启用地理定位，锚点: LLA({TARGET_LONGITUDE}, {TARGET_LATITUDE}, {TARGET_HEIGHT})")
+        try:
+            transform_matrix = trimesh.transformations.east_north_up_to_ecef(
+                longitude=TARGET_LONGITUDE, latitude=TARGET_LATITUDE, height=TARGET_HEIGHT
+            )
+            # ts.root.transform is already snake_case and expects a list of floats
+            ts.root.transform = [float(x) for x in transform_matrix.flatten('F').tolist()]
+        except Exception as e:
+            print(f"错误: 计算地理变换矩阵时失败: {e}")
+
+    # 4.4 循环为每个LOD创建带内容的瓦片，并建立父子链接
+    parent_tile = ts.root  # 从根瓦片开始，作为第一个父节点
+    tile_counter = 0
+
+    for lod_level in range(LOD_LEVELS):
+        lod_data = all_lods_data[lod_level]
+        voxel_centers = lod_data['centers']
+        pitch = lod_data['pitch']
+        
+        if len(voxel_centers) == 0:
+            print(f"LOD {lod_level} 没有体素，跳过。")
+            continue
+
+        print(f"正在为 LOD {lod_level} 创建瓦片...")
+        
+        # A. 创建B3DM内容文件
+        b3dm_content, merged_mesh = create_b3dm_content(voxel_centers, pitch)
+        if b3dm_content is None:
+            print(f"  LOD {lod_level} 的 B3DM 内容创建失败，跳过此瓦片。")
+            continue
+        b3dm_filename = f"tile_lod{lod_level}_{tile_counter}.b3dm"
+        b3dm_filepath = os.path.join(OUTPUT_DIR, b3dm_filename)
+        with open(b3dm_filepath, 'wb') as f:
+            f.write(b3dm_content.to_array())
+        print(f"  已生成内容文件: {b3dm_filename}")
+        tile_counter += 1
+
+        # B. 创建一个新的瓦片对象来承载这个LOD
+        lod_tile = Tile()
+        
+        # C. 为这个新瓦片设置所有必需的属性
+        lod_tile.content = {'uri': b3dm_filename}
+        lod_tile.geometric_error = float(ts.geometric_error * (GEOMETRIC_ERROR_LOD_FACTOR ** (lod_level + 1))) # 使用 snake_case 并确保 float
+        
+        # 使用当前LOD合并后网格的精确边界作为其包围盒
+        min_b, max_b = merged_mesh.bounds
         c = (min_b + max_b) / 2
         hs = (max_b - min_b) / 2
-        tile_for_lod.boundingVolume = {'box': [c[0],c[1],c[2], hs[0],0,0, 0,hs[1],0, 0,0,hs[2]]}
-    else: # 默认小包围盒
-        tile_for_lod.boundingVolume = {'box': [0,0,0, 0.1,0,0, 0,0.1,0, 0,0,0.1]}
+        lod_tile.bounding_volume = {'box': [ # 使用 snake_case 并确保 float
+            float(c[0]), float(c[1]), float(c[2]), 
+            float(hs[0]), 0.0, 0.0, 
+            0.0, float(hs[1]), 0.0, 
+            0.0, 0.0, float(hs[2])
+        ]}
+        print(f"  已设置包围盒和几何误差。")
 
-    # 如果这是最后一个LOD层级，确保它没有children refine（如果有内容）
-    if lod_level == LOD_LEVELS -1:
-        tile_for_lod.refine = None # 或者 'REPLACE' 如果它有内容
-    else:
-        tile_for_lod.refine = 'REPLACE' # 或 'ADD'，取决于LOD策略
+        # D. 将这个属性完备的瓦片链接到其父瓦片
+        if parent_tile.children is None:
+            parent_tile.children = []
+        parent_tile.children.append(lod_tile)
+        print(f"  已将 LOD {lod_level} 瓦片链接到上一级。")
 
-# --- 保存 tileset.json ---
-tileset_json_path = os.path.join(OUTPUT_DIR, "tileset.json")
-with open(tileset_json_path, 'w') as f:
-    json.dump(ts.to_dict(), f, indent=2)
-print(f"Tileset JSON 已保存到: {tileset_json_path}")
+        # E. 如果这不是最后一个LOD，那么它也需要作为下一个LOD的父节点
+        if lod_level < LOD_LEVELS - 1:
+            lod_tile.refine = 'REPLACE'
+            # 更新指针，让当前瓦片成为下一次循环的父瓦片
+            parent_tile = lod_tile
+            
+    # --- 重构结束 ---
 
-print(f"\n3D Tiles 数据集生成完毕，位于目录: {OUTPUT_DIR}")
-print("请将此目录部署到HTTP服务器，或在UE5中从本地文件加载 tileset.json。")
+    print("\n--- 5. 保存 tileset.json ---")
+    try:
+        # 现在调用 to_dict() 应该是安全的
+        tileset_dict = ts.to_dict()
+        # 最后的清理，以防万一
+        cleaned_tileset_dict = fix_numpy_types_in_dict(tileset_dict)
+        
+        tileset_json_path = os.path.join(OUTPUT_DIR, "tileset.json")
+        with open(tileset_json_path, 'w') as f:
+            json.dump(cleaned_tileset_dict, f, indent=4)
+        print(f"Tileset JSON 已成功保存到: {tileset_json_path}")
+
+    except Exception as e:
+        print(f"保存 tileset.json 时出错: {e}")
+        traceback.print_exc()
+
+    print(f"\n处理完成！3D Tiles 数据集位于目录: '{OUTPUT_DIR}'")
+    print("现在可以将此目录部署到HTTP服务器，或在UE5中从本地文件加载 tileset.json。")
+
+
+if __name__ == '__main__':
+    main()
