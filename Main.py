@@ -32,10 +32,8 @@ MODEL_FILE_PATH = r"D:\Datasets\PCLAsset\point_cloud.ply"  # 输入模型文件�
 OUTPUT_DIR = "output_3dtiles_b3dm"  # 输出3D Tiles数据集的目录
 
 # --- 地理定位配置 ---
-# !!! 重要: 请将以下经纬高替换为您模型的实际地理锚点 !!!
-# 这是将您的本地模型放置到地球正确位置的关键
 GEOLOCATION_ENABLED = False  # 是否启用地理定位
-# 示例: 武汉大学附近某点
+# 武汉大学附近某点
 TARGET_LONGITUDE = 114.36
 TARGET_LATITUDE = 30.54
 TARGET_HEIGHT = 50.0  # 相对于WGS84椭球的高度(米)
@@ -420,7 +418,6 @@ def main():
         traceback.print_exc()
 
     print(f"\n处理完成！3D Tiles 数据集位于目录: '{OUTPUT_DIR}'")
-    print("现在可以将此目录部署到HTTP服务器，或在UE5中从本地文件加载 tileset.json。")
 
 
 if __name__ == '__main__':
